@@ -87,6 +87,10 @@ static Hasher* g_hasherInst = nullptr;
 static HANDLE       g_hConsoleThread  = nullptr;
 static std::atomic_bool g_consoleExit = false;
 
+static const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\KrkrDump-Hasher";
+static HANDLE          g_hPipeThread = nullptr;
+static std::atomic_bool g_pipeExit{false};
+
 ComputeHashProc pfnComputePathName = NULL;
 ComputeHashProc pfnComputeFileName = NULL;
 
@@ -1905,22 +1909,120 @@ void InstallHooks()
 #endif
 }
 
+static std::string WStringToUtf8(const std::wstring& ws)
+{
+    if (ws.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(len - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, s.data(), len, nullptr, nullptr);
+    return s;
+}
+
+static std::string CalcHashHex(const std::wstring& text,
+							   const std::wstring& salt)
+{
+	if (!g_hasherInst || text.empty()) return {};
+
+	tTJSString in(text.c_str());
+	tTJSString sl(salt.c_str());
+	tTJSVariant hv;
+
+	(g_hasherInst->*pfnComputeFileName)(&hv, &in, &sl);
+	if (hv.Type() != tvtOctet) return {};
+
+	auto oct = hv.AsOctetNoAddRef();
+	wchar_t hex[80]{};
+	PrintHexString(hex, _countof(hex), oct->GetData(), oct->GetLength());
+
+	std::wstring w(hex);
+	return WStringToUtf8(w);
+}
+
+DWORD WINAPI PipeServerThread(LPVOID)
+{
+    while (!g_pipeExit.load())
+    {
+        HANDLE hPipe = CreateNamedPipeW(
+            PIPE_NAME,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES, 0, 0, 0, nullptr);
+
+        if (hPipe == INVALID_HANDLE_VALUE) return 0;
+
+        BOOL ok = ConnectNamedPipe(hPipe, nullptr) ? TRUE :
+                  (GetLastError() == ERROR_PIPE_CONNECTED);
+
+        if (ok)
+        {
+            char inBuf[512] = {};
+            DWORD cbRead = 0;
+        	
+            if (ReadFile(hPipe, inBuf, sizeof(inBuf), &cbRead, nullptr) && cbRead)
+            {
+            	std::string cmdUtf8(inBuf, cbRead);
+            	while (!cmdUtf8.empty() && (cmdUtf8.back()=='\n' || cmdUtf8.back()=='\r'))
+            		cmdUtf8.pop_back();
+
+            	int wlen = MultiByteToWideChar(CP_UTF8, 0,
+											   cmdUtf8.data(), (int)cmdUtf8.size(),
+											   nullptr, 0);
+            	std::wstring cmd(wlen, L'\0');
+            	MultiByteToWideChar(CP_UTF8, 0,
+									cmdUtf8.data(), (int)cmdUtf8.size(),
+									&cmd[0], wlen);
+
+            	size_t pos = cmd.find(L'|');
+            	std::wstring payload = (pos==std::wstring::npos)
+									   ? cmd : cmd.substr(0,pos);
+            	std::wstring salt    = (pos==std::wstring::npos)
+									   ? L"" : cmd.substr(pos+1);
+            	// wprintf(L"%s %s\n", payload.c_str(), salt.c_str());
+
+            	std::string reply = CalcHashHex(payload, salt);
+            	if (reply.empty()) reply = "ERR\n";
+            	reply.append("\n");
+
+                DWORD cbWritten;
+                WriteFile(hPipe, reply.data(),
+                          reply.size(),
+                          &cbWritten, nullptr);
+            }
+        }
+    	DisconnectNamedPipe(hPipe);
+        CloseHandle(hPipe);
+    }
+    return 0;
+}
+
 DWORD WINAPI ConsoleThreadProc(LPVOID)
 {
 	AllocConsole();
+	SetConsoleCP(CP_UTF8);
+	SetConsoleOutputCP(CP_UTF8);
 	freopen("CONIN$",  "r", stdin);
 	freopen("CONOUT$", "w", stdout);
 	SetConsoleTitleW(L"KrkrDump Console");
 	wprintf(L"[KrkrDump] Usage: \nhash <input> [<salt>=xp3hnp]\n");
 	
-	wchar_t line[512]{};
+	char line[512]{};
 	while (!g_consoleExit.load())
 	{
-		if (!fgetws(line, _countof(line), stdin)) break;
+		if (!fgets(line, _countof(line), stdin)) break;
 		
-		std::wstring cmd(line);
-		while (!cmd.empty() && (cmd.back()==L'\r' || cmd.back()==L'\n'))
-			cmd.pop_back();
+		std::string cmdUtf8(line);
+		while (!cmdUtf8.empty() &&
+			   (cmdUtf8.back()=='\n' || cmdUtf8.back()=='\r'))
+			cmdUtf8.pop_back();
+
+		int wlen = MultiByteToWideChar(CP_UTF8, 0,
+									   cmdUtf8.data(), (int)cmdUtf8.size(),
+									   nullptr, 0);
+		if (wlen <= 0) continue;
+		std::wstring cmd(wlen, L'\0');
+		MultiByteToWideChar(CP_UTF8, 0,
+							cmdUtf8.data(), (int)cmdUtf8.size(),
+							cmd.data(), wlen);
 		
 		if (cmd.rfind(L"hash ", 0) == 0)
 		{
@@ -1934,23 +2036,11 @@ DWORD WINAPI ConsoleThreadProc(LPVOID)
 				continue;
 			}
 
-			tTJSString in (payload.c_str());
-			tTJSString salt (saltStr.c_str());
-			tTJSVariant hv;
-			
-			(g_hasherInst->*pfnComputeFileName)(&hv, &in, &salt);
-
-			if (hv.Type() == tvtOctet)
-			{
-				auto oct = hv.AsOctetNoAddRef();
-				wchar_t hex[80]{};
-				PrintHexString(hex, _countof(hex), oct->GetData(), oct->GetLength());
-				wprintf(L"hash(\"%s\") = %s\n", payload.c_str(), hex);
-			}
-			else
-			{
+			std::string hex = CalcHashHex(payload, saltStr);
+			if (hex.empty())
 				wprintf(L"[!] ComputeFileName failed.\n");
-			}
+			else
+				wprintf(L"%s\n", Encoding::AnsiToUnicode(hex.c_str(), CP_UTF8).c_str());
 		}
 		else
 		{
@@ -2013,6 +2103,8 @@ void OnStartup()
 		g_logger.WriteLine(L"Failed to install hooks");
 	}
 
+	g_hPipeThread = CreateThread(nullptr, 0, PipeServerThread,
+								 nullptr, 0, nullptr);
 	g_hConsoleThread = CreateThread(
 		nullptr, 0,
 		ConsoleThreadProc,
@@ -2025,6 +2117,12 @@ void OnShutdown()
 	g_logger.WriteLine(L"Shutdown");
 	g_logger.Close();
 
+	g_pipeExit = true;
+	if (g_hPipeThread)
+	{
+		WaitForSingleObject(g_hPipeThread, 2000);
+		CloseHandle(g_hPipeThread);
+	}
 	g_consoleExit = true;
 	if (g_hConsoleThread)
 	{
