@@ -16,6 +16,10 @@
 #include <unordered_map>
 #include <shlobj.h>
 
+#include <windows.h>
+#include <cstdio>
+#include <atomic>
+
 #pragma warning ( push )
 #pragma warning ( disable : 4100 4201 4457 )
 #include "tp_stub.h"
@@ -79,6 +83,9 @@ void UnInlineHook(T& OriginalFunction, T DetourFunction)
 class Hasher;
 typedef int (Hasher::*ComputeHashProc)(tTJSVariant*, tTJSString*, tTJSString*);
 
+static Hasher* g_hasherInst = nullptr;
+static HANDLE       g_hConsoleThread  = nullptr;
+static std::atomic_bool g_consoleExit = false;
 
 ComputeHashProc pfnComputePathName = NULL;
 ComputeHashProc pfnComputeFileName = NULL;
@@ -181,6 +188,8 @@ public:
 
 	int ComputeFileName(tTJSVariant* hash, tTJSString* input, tTJSString* salt)
 	{
+		if (!g_hasherInst) g_hasherInst = this;
+		
 		int result = (this->*pfnComputeFileName)(hash, input, salt);
 
 		if (g_tvpStubInitialized && hash && hash->Type() == tvtOctet)
@@ -1896,6 +1905,62 @@ void InstallHooks()
 #endif
 }
 
+DWORD WINAPI ConsoleThreadProc(LPVOID)
+{
+	AllocConsole();
+	freopen("CONIN$",  "r", stdin);
+	freopen("CONOUT$", "w", stdout);
+	SetConsoleTitleW(L"KrkrDump Console");
+	wprintf(L"[KrkrDump] Usage: \nhash <input> [<salt>=xp3hnp]\n");
+	
+	wchar_t line[512]{};
+	while (!g_consoleExit.load())
+	{
+		if (!fgetws(line, _countof(line), stdin)) break;
+		
+		std::wstring cmd(line);
+		while (!cmd.empty() && (cmd.back()==L'\r' || cmd.back()==L'\n'))
+			cmd.pop_back();
+		
+		if (cmd.rfind(L"hash ", 0) == 0)
+		{
+			size_t pos = cmd.find(L' ', 5);
+			std::wstring payload = cmd.substr(5, pos - 5);
+			std::wstring saltStr = (pos == std::wstring::npos) ? L"xp3hnp" : cmd.substr(pos + 1);
+
+			if (!g_hasherInst)
+			{
+				wprintf(L"[!] Hasher isn't initialized, try again later.\n");
+				continue;
+			}
+
+			tTJSString in (payload.c_str());
+			tTJSString salt (saltStr.c_str());
+			tTJSVariant hv;
+			
+			(g_hasherInst->*pfnComputeFileName)(&hv, &in, &salt);
+
+			if (hv.Type() == tvtOctet)
+			{
+				auto oct = hv.AsOctetNoAddRef();
+				wchar_t hex[80]{};
+				PrintHexString(hex, _countof(hex), oct->GetData(), oct->GetLength());
+				wprintf(L"hash(\"%s\") = %s\n", payload.c_str(), hex);
+			}
+			else
+			{
+				wprintf(L"[!] ComputeFileName failed.\n");
+			}
+		}
+		else
+		{
+			wprintf(L"[!] Unknown command.\n");
+		}
+	}
+	
+	FreeConsole();
+	return 0;
+}
 
 void OnStartup()
 {
@@ -1947,6 +2012,11 @@ void OnStartup()
 	{
 		g_logger.WriteLine(L"Failed to install hooks");
 	}
+
+	g_hConsoleThread = CreateThread(
+		nullptr, 0,
+		ConsoleThreadProc,
+		nullptr, 0, nullptr);
 }
 
 
@@ -1954,6 +2024,13 @@ void OnShutdown()
 {
 	g_logger.WriteLine(L"Shutdown");
 	g_logger.Close();
+
+	g_consoleExit = true;
+	if (g_hConsoleThread)
+	{
+		WaitForSingleObject(g_hConsoleThread, 2000);
+		CloseHandle(g_hConsoleThread);
+	}
 }
 
 
