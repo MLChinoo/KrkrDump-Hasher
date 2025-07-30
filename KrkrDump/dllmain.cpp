@@ -1918,7 +1918,7 @@ static std::string WStringToUtf8(const std::wstring& ws)
     return s;
 }
 
-static std::string CalcHashHex(const std::wstring& text,
+static std::string CalcNameHashHex(const std::wstring& text,
 							   const std::wstring& salt)
 {
 	if (!g_hasherInst || text.empty()) return {};
@@ -1928,6 +1928,26 @@ static std::string CalcHashHex(const std::wstring& text,
 	tTJSVariant hv;
 
 	(g_hasherInst->*pfnComputeFileName)(&hv, &in, &sl);
+	if (hv.Type() != tvtOctet) return {};
+
+	auto oct = hv.AsOctetNoAddRef();
+	wchar_t hex[80]{};
+	PrintHexString(hex, _countof(hex), oct->GetData(), oct->GetLength());
+
+	std::wstring w(hex);
+	return WStringToUtf8(w);
+}
+
+static std::string CalcPathHashHex(const std::wstring& text,
+								   const std::wstring& salt)
+{
+	if (!g_hasherInst || text.empty()) return {};
+
+	tTJSString in(text.c_str());
+	tTJSString sl(salt.c_str());
+	tTJSVariant hv;
+
+	(g_hasherInst->*pfnComputePathName)(&hv, &in, &sl);
 	if (hv.Type() != tvtOctet) return {};
 
 	auto oct = hv.AsOctetNoAddRef();
@@ -1972,21 +1992,30 @@ DWORD WINAPI PipeServerThread(LPVOID)
 									cmdUtf8.data(), (int)cmdUtf8.size(),
 									&cmd[0], wlen);
 
+            	bool isNameHash = false, isPathHash = false;
+
+            	if (cmd.rfind(L"N|", 0) == 0) { isNameHash = true; cmd.erase(0, 2); }
+            	else if (cmd.rfind(L"P|", 0) == 0) { isPathHash = true; cmd.erase(0, 2); }
+            	else {                                       // 未知前缀
+            		std::string reply = "ERR\n";
+            		DWORD cbWritten; WriteFile(hPipe, reply.data(), reply.size(), &cbWritten, nullptr);
+            		DisconnectNamedPipe(hPipe); CloseHandle(hPipe); continue;
+            	}
+
             	size_t pos = cmd.find(L'|');
             	std::wstring payload = (pos==std::wstring::npos)
 									   ? cmd : cmd.substr(0,pos);
             	std::wstring salt    = (pos==std::wstring::npos)
-									   ? L"" : cmd.substr(pos+1);
+									   ? L"xp3hnp" : cmd.substr(pos+1);
             	// wprintf(L"%s %s\n", payload.c_str(), salt.c_str());
 
-            	std::string reply = CalcHashHex(payload, salt);
-            	if (reply.empty()) reply = "ERR\n";
+            	std::string reply = isPathHash
+            						? CalcPathHashHex(payload, salt) : CalcNameHashHex(payload, salt);
+            	if (reply.empty()) reply = "ERR";
             	reply.append("\n");
 
-                DWORD cbWritten;
-                WriteFile(hPipe, reply.data(),
-                          reply.size(),
-                          &cbWritten, nullptr);
+            	DWORD cbWritten;
+            	WriteFile(hPipe, reply.data(), reply.size(), &cbWritten, nullptr);
             }
         }
     	DisconnectNamedPipe(hPipe);
@@ -2003,7 +2032,7 @@ DWORD WINAPI ConsoleThreadProc(LPVOID)
 	freopen("CONIN$",  "r", stdin);
 	freopen("CONOUT$", "w", stdout);
 	SetConsoleTitleW(L"KrkrDump Console");
-	wprintf(L"[KrkrDump] Usage: \nhash <input> [<salt>=xp3hnp]\n");
+	wprintf(L"[KrkrDump] Usage:\n  namehash <path> [salt=xp3hnp]\n  pathhash <path> [salt=xp3hnp]\n");
 	
 	char line[512]{};
 	while (!g_consoleExit.load())
@@ -2024,10 +2053,10 @@ DWORD WINAPI ConsoleThreadProc(LPVOID)
 							cmdUtf8.data(), (int)cmdUtf8.size(),
 							cmd.data(), wlen);
 		
-		if (cmd.rfind(L"hash ", 0) == 0)
+		if (cmd.rfind(L"namehash ", 0) == 0)
 		{
-			size_t pos = cmd.find(L' ', 5);
-			std::wstring payload = cmd.substr(5, pos - 5);
+			size_t pos = cmd.find(L' ', 9);
+			std::wstring payload = cmd.substr(9, pos - 9);
 			std::wstring saltStr = (pos == std::wstring::npos) ? L"xp3hnp" : cmd.substr(pos + 1);
 
 			if (!g_hasherInst)
@@ -2036,7 +2065,25 @@ DWORD WINAPI ConsoleThreadProc(LPVOID)
 				continue;
 			}
 
-			std::string hex = CalcHashHex(payload, saltStr);
+			std::string hex = CalcNameHashHex(payload, saltStr);
+			if (hex.empty())
+				wprintf(L"[!] ComputeFileName failed.\n");
+			else
+				wprintf(L"%s\n", Encoding::AnsiToUnicode(hex.c_str(), CP_UTF8).c_str());
+		}
+		else if (cmd.rfind(L"pathhash ", 0) == 0)
+		{
+			size_t pos = cmd.find(L' ', 9);
+			std::wstring payload = cmd.substr(9, pos - 9);
+			std::wstring saltStr = (pos == std::wstring::npos) ? L"xp3hnp" : cmd.substr(pos + 1);
+
+			if (!g_hasherInst)
+			{
+				wprintf(L"[!] Hasher isn't initialized, try again later.\n");
+				continue;
+			}
+
+			std::string hex = CalcPathHashHex(payload, saltStr);
 			if (hex.empty())
 				wprintf(L"[!] ComputeFileName failed.\n");
 			else
